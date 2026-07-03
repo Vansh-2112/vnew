@@ -1,0 +1,16 @@
+'======================================================================
+' ThisWorkbook  (PASTE this into the ThisWorkbook object - do NOT import)
+'----------------------------------------------------------------------
+' Double-click "ThisWorkbook" in the VBA Project Explorer and paste the
+' code below. This is a safety net: if a previous session crashed while
+' calculation was set to manual, this restores normal behaviour on open.
+'======================================================================
+Option Explicit
+
+Private Sub Workbook_Open()
+    On Error Resume Next
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Application.DisplayAlerts = True
+End Sub

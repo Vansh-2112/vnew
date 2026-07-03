@@ -1,0 +1,635 @@
+Attribute VB_Name = "modTradeLookup"
+Option Explicit
+
+'======================================================================
+' modTradeLookup  -  Vinzor Trade Lookup (single-module build)
+'----------------------------------------------------------------------
+' Everything lives here:
+'   * Configuration constants
+'   * Persisted source-file path
+'   * Fast-mode (Excel settings) save/restore
+'   * Generic helpers
+'   * Source workbook + plain-range block detection
+'   * Counterparty code -> name mapping
+'   * The three button macros: BrowseSourceWorkbook / ExtractTrades /
+'     ResetSheet
+'
+' (The Workbook_Open safety net stays in the ThisWorkbook object.)
+'======================================================================
+
+
+'======================================================================
+' CONFIGURATION  -  the only place to change text
+'======================================================================
+
+' Header the USER types on the working sheet (input column).
+Public Const HEADER_TRADE_ID   As String = "Trade ID"
+
+' Header that identifies the Trade ID column inside the SOURCE data.
+Public Const HEADER_SOURCE_ID  As String = "Barclays Trade ID"
+
+' --- Counterparty mapping ---
+Public Const MAP_SHEET_NAME    As String = "Mapping"
+Public Const MAP_COL_CODE      As String = "Counterparty Code"
+Public Const MAP_COL_NAME      As String = "Counterparty Name"
+' Output column whose fetched codes get replaced by names:
+Public Const MAP_TARGET_HEADER As String = "Counterparty"
+
+' Label cell on the working sheet whose right-hand neighbour shows the
+' selected source-file path.
+Public Const LABEL_SOURCE_FILE As String = "Source File"
+
+' Custom document property that remembers the chosen source file.
+Private Const NAME_SOURCE_PATH As String = "VinzorSourcePath"
+
+
+'======================================================================
+' PERSISTED SOURCE PATH
+'======================================================================
+Public Sub SetSourcePath(ByVal sPath As String)
+    On Error Resume Next
+    ThisWorkbook.CustomDocumentProperties(NAME_SOURCE_PATH).Delete
+    On Error GoTo 0
+    ThisWorkbook.CustomDocumentProperties.Add _
+        Name:=NAME_SOURCE_PATH, LinkToContent:=False, _
+        Type:=msoPropertyTypeString, Value:=sPath
+End Sub
+
+Public Function GetSourcePath() As String
+    Dim s As String
+    On Error Resume Next
+    s = ThisWorkbook.CustomDocumentProperties(NAME_SOURCE_PATH).Value
+    On Error GoTo 0
+    GetSourcePath = s
+End Function
+
+
+'======================================================================
+' FAST MODE  -  save / restore Excel settings
+'======================================================================
+Private Type TAppState
+    ScreenUpdating As Boolean
+    EnableEvents   As Boolean
+    DisplayAlerts  As Boolean
+    Calculation    As XlCalculation
+    StatusBar      As Variant
+    Captured       As Boolean
+End Type
+Private mState As TAppState
+
+Public Sub FastModeOn()
+    With Application
+        If Not mState.Captured Then
+            mState.ScreenUpdating = .ScreenUpdating
+            mState.EnableEvents = .EnableEvents
+            mState.DisplayAlerts = .DisplayAlerts
+            mState.Calculation = .Calculation
+            mState.StatusBar = .StatusBar
+            mState.Captured = True
+        End If
+        .ScreenUpdating = False
+        .EnableEvents = False
+        .DisplayAlerts = False
+        .Calculation = xlCalculationManual
+    End With
+End Sub
+
+Public Sub FastModeOff()
+    With Application
+        If mState.Captured Then
+            .ScreenUpdating = mState.ScreenUpdating
+            .EnableEvents = mState.EnableEvents
+            .DisplayAlerts = mState.DisplayAlerts
+            .Calculation = mState.Calculation
+            .StatusBar = mState.StatusBar
+            mState.Captured = False
+        Else
+            .ScreenUpdating = True
+            .EnableEvents = True
+            .DisplayAlerts = True
+            .Calculation = xlCalculationAutomatic
+            .StatusBar = False
+        End If
+    End With
+End Sub
+
+
+'======================================================================
+' GENERIC HELPERS
+'======================================================================
+
+' Whole-cell, case-insensitive search for a header on a sheet.
+Public Function FindHeaderCell(ByVal ws As Worksheet, _
+                               ByVal headerText As String) As Range
+    Dim f As Range
+    On Error Resume Next
+    Set f = ws.Cells.Find(What:=headerText, LookIn:=xlValues, _
+                          LookAt:=xlWhole, SearchOrder:=xlByRows, _
+                          MatchCase:=False)
+    On Error GoTo 0
+    Set FindHeaderCell = f
+End Function
+
+' Normalise any cell value into a comparable string (integers never
+' become scientific notation).
+Public Function NormID(ByVal v As Variant) As String
+    If IsError(v) Then
+        NormID = vbNullString
+    ElseIf IsNull(v) Then
+        NormID = vbNullString
+    ElseIf IsNumeric(v) Then
+        Dim d As Double
+        d = CDbl(v)
+        If d = Int(d) And Abs(d) < 1E+15 Then
+            NormID = Trim$(Format$(d, "0"))
+        Else
+            NormID = Trim$(CStr(v))
+        End If
+    Else
+        NormID = Trim$(CStr(v))
+    End If
+End Function
+
+' Guarantee a Range.Value result is always a 1-based 2D array.
+Public Function ToArray2D(ByVal v As Variant) As Variant
+    Dim a() As Variant
+    If IsArray(v) Then
+        ToArray2D = v
+    Else
+        ReDim a(1 To 1, 1 To 1)
+        a(1, 1) = v
+        ToArray2D = a
+    End If
+End Function
+
+' Format up to 'cap' dictionary keys for a message.
+Public Function JoinKeys(ByVal d As Object, ByVal sep As String, _
+                         ByVal cap As Long) As String
+    Dim k As Variant, s As String, n As Long
+    For Each k In d.Keys
+        n = n + 1
+        If n > cap Then
+            s = s & sep & "...(" & (d.Count - cap) & " more)"
+            Exit For
+        End If
+        If Len(s) = 0 Then s = CStr(k) Else s = s & sep & CStr(k)
+    Next k
+    JoinKeys = s
+End Function
+
+
+'======================================================================
+' SOURCE WORKBOOK + PLAIN-RANGE BLOCK DETECTION
+'======================================================================
+
+' Open the persisted source workbook (read-only), or reuse if open.
+Public Function GetSourceWorkbook() As Workbook
+    Dim sPath As String, sName As String, wb As Workbook
+
+    sPath = GetSourcePath()
+    If Len(sPath) = 0 Then
+        Err.Raise vbObjectError + 513, , _
+            "No source workbook selected. Click 'Browse Workbook' first."
+    End If
+    If Dir$(sPath) = vbNullString Then
+        Err.Raise vbObjectError + 514, , _
+            "The selected source file no longer exists:" & vbCrLf & sPath
+    End If
+
+    sName = Mid$(sPath, InStrRev(sPath, "\") + 1)
+
+    On Error Resume Next
+    Set wb = Application.Workbooks(sName)
+    On Error GoTo 0
+
+    If wb Is Nothing Then
+        On Error GoTo OpenFail
+        Set wb = Application.Workbooks.Open( _
+                    Filename:=sPath, ReadOnly:=True, UpdateLinks:=0)
+        On Error GoTo 0
+    End If
+
+    Set GetSourceWorkbook = wb
+    Exit Function
+OpenFail:
+    Err.Raise vbObjectError + 515, , _
+        "The source workbook could not be opened:" & vbCrLf & sPath
+End Function
+
+' Every cell on ws that exactly equals headerText (each anchors a block).
+Public Function FindAllHeaderCells(ByVal ws As Worksheet, _
+                                   ByVal headerText As String) As Collection
+    Dim result As Collection, f As Range, firstAddr As String
+    Set result = New Collection
+    Set f = ws.Cells.Find(What:=headerText, LookIn:=xlValues, _
+                          LookAt:=xlWhole, SearchOrder:=xlByRows, _
+                          MatchCase:=False)
+    If Not f Is Nothing Then
+        firstAddr = f.Address
+        Do
+            result.Add f
+            Set f = ws.Cells.FindNext(f)
+            If f Is Nothing Then Exit Do
+        Loop While f.Address <> firstAddr
+    End If
+    Set FindAllHeaderCells = result
+End Function
+
+' First block anywhere with the source Trade ID header.
+Public Function FindFirstSourceHeaderCell(ByVal wb As Workbook) As Range
+    Dim ws As Worksheet, hcs As Collection
+    For Each ws In wb.Worksheets
+        Set hcs = FindAllHeaderCells(ws, HEADER_SOURCE_ID)
+        If hcs.Count > 0 Then
+            Set FindFirstSourceHeaderCell = hcs(1)
+            Exit Function
+        End If
+    Next ws
+    Set FindFirstSourceHeaderCell = Nothing
+End Function
+
+' Derive a block's bounds from the header cell's CurrentRegion.
+Public Sub GetBlockBounds(ByVal headerCell As Range, _
+                          ByRef hdrRow As Long, ByRef firstCol As Long, _
+                          ByRef lastCol As Long, ByRef lastRow As Long)
+    Dim blk As Range
+    Set blk = headerCell.CurrentRegion
+    hdrRow = headerCell.Row
+    firstCol = blk.Column
+    lastCol = blk.Column + blk.Columns.Count - 1
+    lastRow = blk.Row + blk.Rows.Count - 1
+End Sub
+
+
+'======================================================================
+' BUTTON 1: Browse Workbook
+'======================================================================
+Public Sub BrowseSourceWorkbook()
+    Dim fd As FileDialog, sPath As String
+
+    Set fd = Application.FileDialog(msoFileDialogFilePicker)
+    With fd
+        .Title = "Select the SOURCE workbook containing the trade data"
+        .AllowMultiSelect = False
+        .Filters.Clear
+        .Filters.Add "Excel Workbooks", "*.xlsx; *.xlsm; *.xlsb; *.xls"
+        If .Show <> -1 Then Exit Sub          ' cancelled
+        sPath = .SelectedItems(1)
+    End With
+
+    SetSourcePath sPath
+    ShowSourcePathOnSheet ActiveSheet, sPath      ' display it in a cell
+    MsgBox "Source workbook set to:" & vbCrLf & vbCrLf & sPath, _
+           vbInformation, "Vinzor Trade Lookup"
+End Sub
+
+
+'======================================================================
+' BUTTON 2: Extract Trades
+'======================================================================
+Public Sub ExtractTrades()
+    Dim ws As Worksheet, hdrCell As Range
+    Dim hdrRow As Long, idCol As Long, outStartCol As Long
+    Dim firstRow As Long, lastRow As Long, nRows As Long
+    Dim arrIDs As Variant
+    Dim dictRows As Object, dictPending As Object, outHdrMap As Object
+    Dim nOut As Long, outArr() As Variant
+    Dim src As Workbook
+    Dim i As Long, sid As String, coll As Collection
+
+    On Error GoTo CleanFail
+    Set ws = ActiveSheet
+
+    ' 1. Locate the Trade ID input header (active sheet only).
+    Set hdrCell = FindHeaderCell(ws, HEADER_TRADE_ID)
+    If hdrCell Is Nothing Then
+        Err.Raise vbObjectError + 520, , _
+            "Header '" & HEADER_TRADE_ID & "' was not found on the active sheet."
+    End If
+    hdrRow = hdrCell.Row
+    idCol = hdrCell.Column
+    outStartCol = idCol + 1
+
+    ' 2. Read every Trade ID below the header.
+    lastRow = ws.Cells(ws.Rows.Count, idCol).End(xlUp).Row
+    If lastRow <= hdrRow Then
+        Err.Raise vbObjectError + 521, , _
+            "No Trade IDs were entered below the '" & HEADER_TRADE_ID & "' header."
+    End If
+    firstRow = hdrRow + 1
+    nRows = lastRow - firstRow + 1
+    arrIDs = ToArray2D(ws.Range(ws.Cells(firstRow, idCol), _
+                                ws.Cells(lastRow, idCol)).Value)
+
+    ' 3. Build lookup dictionaries (duplicates supported).
+    Set dictRows = CreateObject("Scripting.Dictionary")
+    Set dictPending = CreateObject("Scripting.Dictionary")
+    For i = 1 To nRows
+        sid = NormID(arrIDs(i, 1))
+        If Len(sid) > 0 Then
+            If Not dictRows.Exists(sid) Then
+                Set coll = New Collection
+                dictRows.Add sid, coll
+                dictPending(sid) = True
+            End If
+            dictRows(sid).Add i
+        End If
+    Next i
+    If dictRows.Count = 0 Then
+        Err.Raise vbObjectError + 521, , _
+            "No non-blank Trade IDs were found below the header."
+    End If
+
+    FastModeOn
+
+    ' 4. Open / reuse source; refresh the displayed path.
+    Set src = GetSourceWorkbook()
+    ShowSourcePathOnSheet ws, src.FullName
+
+    ' 5. Detect existing output headers or establish them once.
+    Set outHdrMap = BuildOutputHeaders(ws, hdrRow, outStartCol, src)
+    nOut = outHdrMap.Count
+    If nOut = 0 Then
+        Err.Raise vbObjectError + 522, , _
+            "Could not determine any output columns from the source data."
+    End If
+
+    ' 6. In-memory output block.
+    ReDim outArr(1 To nRows, 1 To nOut)
+
+    ' 7. Scan source blocks, fill array, early-exit when done.
+    ScanSource src, dictRows, dictPending, outHdrMap, outArr
+
+    ' 8. Replace counterparty codes with names (if Mapping sheet exists).
+    ApplyCptyMapping outArr, outHdrMap
+
+    ' 9. One bulk write.
+    ws.Range(ws.Cells(firstRow, outStartCol), _
+             ws.Cells(lastRow, outStartCol + nOut - 1)).Value = outArr
+
+    FastModeOff
+
+    ' 10. Report any not-found IDs.
+    If dictPending.Count > 0 Then
+        MsgBox "Extraction complete." & vbCrLf & vbCrLf & _
+               dictPending.Count & " Trade ID(s) were NOT found:" & vbCrLf & _
+               JoinKeys(dictPending, ", ", 25), _
+               vbExclamation, "Vinzor Trade Lookup"
+    Else
+        MsgBox "Extraction complete. All Trade IDs were found.", _
+               vbInformation, "Vinzor Trade Lookup"
+    End If
+    Exit Sub
+
+CleanFail:
+    FastModeOff
+    MsgBox "Extraction stopped:" & vbCrLf & vbCrLf & Err.Description, _
+           vbCritical, "Vinzor Trade Lookup"
+End Sub
+
+
+'======================================================================
+' BUTTON 3: Reset Sheet
+'======================================================================
+Public Sub ResetSheet()
+    Dim ws As Worksheet, hdrCell As Range
+    Dim hdrRow As Long, idCol As Long, outStartCol As Long
+    Dim lastOutCol As Long, lastRow As Long, c As Long, rr As Long
+
+    On Error GoTo CleanFail
+    Set ws = ActiveSheet
+
+    Set hdrCell = FindHeaderCell(ws, HEADER_TRADE_ID)
+    If hdrCell Is Nothing Then
+        Err.Raise vbObjectError + 520, , _
+            "Header '" & HEADER_TRADE_ID & "' was not found on the active sheet."
+    End If
+    hdrRow = hdrCell.Row
+    idCol = hdrCell.Column
+    outStartCol = idCol + 1
+
+    lastOutCol = idCol
+    c = outStartCol
+    Do While Len(Trim$(CStr(ws.Cells(hdrRow, c).Value))) > 0
+        lastOutCol = c
+        c = c + 1
+    Loop
+
+    lastRow = ws.Cells(ws.Rows.Count, idCol).End(xlUp).Row
+    For c = outStartCol To lastOutCol
+        rr = ws.Cells(ws.Rows.Count, c).End(xlUp).Row
+        If rr > lastRow Then lastRow = rr
+    Next c
+
+    If lastRow > hdrRow Then
+        FastModeOn
+        On Error Resume Next
+        ws.Range(ws.Cells(hdrRow + 1, idCol), _
+                 ws.Cells(lastRow, lastOutCol)) _
+                 .SpecialCells(xlCellTypeConstants).ClearContents
+        On Error GoTo CleanFail
+        FastModeOff
+    End If
+
+    MsgBox "Sheet reset. Headers preserved; ready for the next batch.", _
+           vbInformation, "Vinzor Trade Lookup"
+    Exit Sub
+
+CleanFail:
+    FastModeOff
+    MsgBox "Reset stopped:" & vbCrLf & vbCrLf & Err.Description, _
+           vbCritical, "Vinzor Trade Lookup"
+End Sub
+
+
+'======================================================================
+' PRIVATE ENGINE HELPERS
+'======================================================================
+
+' Reuse existing output headers, else establish from the first block.
+Private Function BuildOutputHeaders(ByVal ws As Worksheet, _
+                                    ByVal hdrRow As Long, _
+                                    ByVal outStartCol As Long, _
+                                    ByVal src As Workbook) As Object
+    Dim map As Object, c As Long, nm As String
+    Set map = CreateObject("Scripting.Dictionary")
+    map.CompareMode = vbTextCompare
+
+    c = outStartCol
+    Do While Len(Trim$(CStr(ws.Cells(hdrRow, c).Value))) > 0
+        nm = Trim$(CStr(ws.Cells(hdrRow, c).Value))
+        If Not map.Exists(nm) Then map.Add nm, (c - outStartCol + 1)
+        c = c + 1
+    Loop
+    If map.Count > 0 Then
+        Set BuildOutputHeaders = map
+        Exit Function
+    End If
+
+    Dim hc As Range
+    Set hc = FindFirstSourceHeaderCell(src)
+    If hc Is Nothing Then
+        Err.Raise vbObjectError + 523, , _
+            "No range containing the '" & HEADER_SOURCE_ID & _
+            "' header was found in the source workbook."
+    End If
+
+    Dim bHdrRow As Long, bFirst As Long, bLast As Long, bLastRow As Long
+    GetBlockBounds hc, bHdrRow, bFirst, bLast, bLastRow
+
+    Dim shSrc As Worksheet
+    Set shSrc = hc.Worksheet
+
+    Dim hdr As Variant, i As Long, localCol As Long
+    hdr = ToArray2D(shSrc.Range(shSrc.Cells(bHdrRow, bFirst), _
+                                shSrc.Cells(bHdrRow, bLast)).Value)
+    localCol = 0
+    For i = 1 To UBound(hdr, 2)
+        nm = Trim$(CStr(hdr(1, i)))
+        If Len(nm) > 0 And _
+           StrComp(nm, HEADER_SOURCE_ID, vbTextCompare) <> 0 Then
+            localCol = localCol + 1
+            ws.Cells(hdrRow, outStartCol + localCol - 1).Value = nm
+            If Not map.Exists(nm) Then map.Add nm, localCol
+        End If
+    Next i
+
+    Set BuildOutputHeaders = map
+End Function
+
+' Scan every block on every sheet; match rows by ID; fill occurrences.
+Private Sub ScanSource(ByVal src As Workbook, ByVal dictRows As Object, _
+                       ByVal dictPending As Object, ByVal outHdrMap As Object, _
+                       ByRef outArr As Variant)
+    Dim ws As Worksheet, hdrCells As Collection, hc As Range
+    Dim hdrRow As Long, firstCol As Long, lastCol As Long, lastRow As Long
+    Dim hdr As Variant, body As Variant
+    Dim idCol As Long, nMap As Long
+    Dim srcCols() As Long, outCols() As Long
+    Dim i As Long, r As Long, k As Long
+    Dim sid As String, nm As String
+    Dim occ As Variant
+
+    For Each ws In src.Worksheets
+        Set hdrCells = FindAllHeaderCells(ws, HEADER_SOURCE_ID)
+
+        For Each hc In hdrCells
+            GetBlockBounds hc, hdrRow, firstCol, lastCol, lastRow
+
+            If lastRow > hdrRow And lastCol >= firstCol Then
+                hdr = ToArray2D(ws.Range(ws.Cells(hdrRow, firstCol), _
+                                         ws.Cells(hdrRow, lastCol)).Value)
+                body = ToArray2D(ws.Range(ws.Cells(hdrRow + 1, firstCol), _
+                                          ws.Cells(lastRow, lastCol)).Value)
+
+                idCol = 0
+                ReDim srcCols(1 To UBound(hdr, 2))
+                ReDim outCols(1 To UBound(hdr, 2))
+                nMap = 0
+                For i = 1 To UBound(hdr, 2)
+                    nm = Trim$(CStr(hdr(1, i)))
+                    If StrComp(nm, HEADER_SOURCE_ID, vbTextCompare) = 0 Then
+                        idCol = i
+                    ElseIf Len(nm) > 0 Then
+                        If outHdrMap.Exists(nm) Then
+                            nMap = nMap + 1
+                            srcCols(nMap) = i
+                            outCols(nMap) = outHdrMap(nm)
+                        End If
+                    End If
+                Next i
+
+                If idCol > 0 Then
+                    For r = 1 To UBound(body, 1)
+                        sid = NormID(body(r, idCol))
+                        If Len(sid) > 0 Then
+                            If dictPending.Exists(sid) Then
+                                For Each occ In dictRows(sid)
+                                    For k = 1 To nMap
+                                        outArr(occ, outCols(k)) = body(r, srcCols(k))
+                                    Next k
+                                Next occ
+                                dictPending.Remove sid
+                                If dictPending.Count = 0 Then Exit Sub
+                            End If
+                        End If
+                    Next r
+                End If
+            End If
+        Next hc
+    Next ws
+End Sub
+
+'----------------------------------------------------------------------
+' Build a code -> name dictionary from the Mapping sheet in THIS
+' workbook. Empty dictionary if the sheet or its headers are missing.
+'----------------------------------------------------------------------
+Private Function BuildCptyMap() As Object
+    Dim d As Object
+    Set d = CreateObject("Scripting.Dictionary")
+    d.CompareMode = vbTextCompare
+
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(MAP_SHEET_NAME)
+    On Error GoTo 0
+    If ws Is Nothing Then Set BuildCptyMap = d: Exit Function
+
+    Dim hCode As Range, hName As Range
+    Set hCode = FindHeaderCell(ws, MAP_COL_CODE)
+    Set hName = FindHeaderCell(ws, MAP_COL_NAME)
+    If hCode Is Nothing Or hName Is Nothing Then Set BuildCptyMap = d: Exit Function
+
+    Dim baseRow As Long, lastRow As Long
+    baseRow = hCode.Row + 1
+    lastRow = ws.Cells(ws.Rows.Count, hCode.Column).End(xlUp).Row
+    If lastRow < baseRow Then Set BuildCptyMap = d: Exit Function
+
+    ' Read code + name columns over the SAME absolute rows.
+    Dim codes As Variant, names As Variant, r As Long, codeStr As String, nm As String
+    codes = ToArray2D(ws.Range(ws.Cells(baseRow, hCode.Column), _
+                               ws.Cells(lastRow, hCode.Column)).Value)
+    names = ToArray2D(ws.Range(ws.Cells(baseRow, hName.Column), _
+                               ws.Cells(lastRow, hName.Column)).Value)
+
+    For r = 1 To UBound(codes, 1)
+        codeStr = NormID(codes(r, 1))
+        If Len(codeStr) > 0 Then
+            If r <= UBound(names, 1) Then nm = CStr(names(r, 1)) Else nm = ""
+            If Not d.Exists(codeStr) Then d.Add codeStr, nm
+        End If
+    Next r
+
+    Set BuildCptyMap = d
+End Function
+
+'----------------------------------------------------------------------
+' Replace codes with names in the target output column, in memory.
+' Codes with no mapping entry are left unchanged.
+'----------------------------------------------------------------------
+Private Sub ApplyCptyMapping(ByRef outArr As Variant, ByVal outHdrMap As Object)
+    If Not outHdrMap.Exists(MAP_TARGET_HEADER) Then Exit Sub
+
+    Dim cmap As Object
+    Set cmap = BuildCptyMap()
+    If cmap.Count = 0 Then Exit Sub
+
+    Dim col As Long, r As Long, codeStr As String
+    col = outHdrMap(MAP_TARGET_HEADER)
+    For r = 1 To UBound(outArr, 1)
+        codeStr = NormID(outArr(r, col))
+        If Len(codeStr) > 0 Then
+            If cmap.Exists(codeStr) Then outArr(r, col) = cmap(codeStr)
+        End If
+    Next r
+End Sub
+
+'----------------------------------------------------------------------
+' Write the source-file path next to a "Source File" label cell if one
+' exists on the sheet. Silent no-op if the label is absent.
+'----------------------------------------------------------------------
+Private Sub ShowSourcePathOnSheet(ByVal ws As Worksheet, ByVal sPath As String)
+    Dim lbl As Range
+    Set lbl = FindHeaderCell(ws, LABEL_SOURCE_FILE)
+    If Not lbl Is Nothing Then lbl.Offset(0, 1).Value = sPath
+End Sub
